@@ -1,115 +1,128 @@
 import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
 import { path as ffmpegPath } from '@ffmpeg-installer/ffmpeg';
-
-import fs from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
-import { promisify } from 'util';
+import dotenv from 'dotenv';
+import { queue } from 'async';
 
-const writeFileAsync = promisify(fs.writeFile);
-const unlinkAsync = promisify(fs.unlink);
-
-const thumbsDir = 'thumbnails';
-const currentDirPath = process.cwd();
-const tempDirPath = path.join(currentDirPath, 'temp');
-const tempDownloadDirPath = path.join(tempDirPath, 'downloads');
-const thumbsDirPath = path.join(currentDirPath, thumbsDir);
-
-const getFileNameFromLocalPath = (localPath) => {
-    const fileName = path.basename(localPath);
-    return fileName;
-}
-const getFileNameFromURL = (fileUrl) => {
-    const parsedUrl = new URL(fileUrl);
-    const fileName = path.basename(parsedUrl.pathname);
-    return fileName;
-}
+dotenv.config();
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-export async function generateThumbnail(videoLocalPath) {
-    try {
-        const videoFileName = getFileNameFromLocalPath(videoLocalPath).split('.')[0];
-        const ext = getFileNameFromLocalPath(videoLocalPath).split('.')[1];
+const config = {
+    thumbsDir: process.env.THUMBS_DIR || 'thumbnails',
+    tempDir: process.env.TEMP_DIR || 'temp',
+};
+
+const currentDirPath = process.cwd();
+const tempDirPath = path.join(currentDirPath, config.tempDir);
+const tempDownloadDirPath = path.join(tempDirPath, 'downloads');
+const thumbsDirPath = path.join(currentDirPath, config.thumbsDir);
+
+class ThumbnailGenerationError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'ThumbnailGenerationError';
+    }
+}
+
+class ThumbnailGenerator {
+    constructor() {
+        this.thumbsDirPath = thumbsDirPath;
+        this.tempDownloadDirPath = tempDownloadDirPath;
+
+        // Initialize a queue to limit concurrency
+        this.queue = queue(async (task, done) => {
+            try {
+                const result = await task();
+
+                console.log("current task result: ", result);
+                return result;
+            } catch (error) {
+                done(error);
+            }
+        }, 5);
+    }
+
+    async generateThumbnail(videoLocalPath) {
+        const videoFileName = path.basename(videoLocalPath, path.extname(videoLocalPath));
+        const ext = path.extname(videoLocalPath).substring(1);
         const thumbnailFilename = `${videoFileName}_thumbnail.png`;
-        const thumbnailFileUrl = `/${thumbsDir}/${thumbnailFilename}`;
+        const thumbnailFileUrl = `/${config.thumbsDir}/${thumbnailFilename}`;
+
         console.log("generateThumbnail | received video local path: ", videoLocalPath);
 
         return new Promise((resolve, reject) => {
             ffmpeg(videoLocalPath)
                 .inputFormat(ext)
-                .on('filenames', function (filenames) {
+                .on('filenames', (filenames) => {
                     console.log('generateThumbnail | Will generate thumbnails: ', filenames);
                 })
-                .on('end', async function () {
+                .on('end', () => {
                     console.log('generateThumbnail | Generated thumbnail successfully at: ', thumbnailFileUrl);
-
                     resolve(thumbnailFileUrl);
                 })
-                .on('error', async function (err) {
+                .on('error', (err) => {
                     console.error('generateThumbnail | Error generating thumbnail: ', err.stack);
-                    reject(err);
+                    reject(new ThumbnailGenerationError(err.message));
                 })
                 .screenshots({
-                    // count: 1,
-                    timemarks: ['0.1'], // Capture at 0.1 seconds
-                    // size: '360x640',
-                    folder: thumbsDirPath,
+                    timemarks: ['0.1'],
+                    folder: this.thumbsDirPath,
                     filename: thumbnailFilename,
                 });
         });
-    } catch (err) {
-        console.error('generateThumbnail | Error: ', err.stack);
-        throw err;
     }
-}
 
-export async function getThumbnailWithPath(videoLocalPath) {
-    try {
-        console.log("getThumbnailWithPath | received video local path: ", videoLocalPath);
-
-        return await new Promise(async (resolve, reject) => {
-            try {
-                resolve(await generateThumbnail(videoLocalPath));
-            } catch (err) {
-                reject(err);
-            }
-        })
-    } catch (err) {
-        console.error('getThumbnailWithPath | Error: ', err.stack);
-        throw err;
+    async getVideoThumbnailWithPath(videoLocalPath) {
+        console.log("getVideoThumbnailWithPath | received video local path: ", videoLocalPath);
+        return this.generateThumbnail(videoLocalPath);
     }
-}
 
-export async function getThumbnailWithUrl(videoUrl) {
-    try {
-        console.log("getThumbnailWithUrl | received video url: ", videoUrl);
+    async getVideoThumbnailWithUrl(videoUrl) {
+        console.log("getVideoThumbnailWithUrl | received video url: ", videoUrl);
 
         const response = await axios.get(videoUrl, { responseType: 'arraybuffer' });
+        const videoFileName = path.basename(videoUrl, path.extname(videoUrl));
+        const ext = path.extname(videoUrl).substring(1);
+        const tempVideoPath = path.join(this.tempDownloadDirPath, `${videoFileName}.${ext}`);
 
-        const videoFileName = getFileNameFromURL(videoUrl).split('.')[0];
-        const ext = getFileNameFromURL(videoUrl).split('.').pop().toLowerCase();
-        const tempVideoPath = path.join(tempDownloadDirPath, `/${videoFileName}.${ext}`);
+        await fs.mkdir(this.tempDownloadDirPath, { recursive: true });
+        await fs.writeFile(tempVideoPath, response.data);
 
-        if (!fs.existsSync(tempDownloadDirPath)) {
-            fs.mkdirSync(tempDownloadDirPath, { recursive: true });
+        try {
+            return await this.getVideoThumbnailWithPath(tempVideoPath);
+        } finally {
+            await fs.unlink(tempVideoPath);
         }
-
-        await writeFileAsync(tempVideoPath, response.data);
-
-        return await new Promise(async (resolve, reject) => {
-            try {
-                const thumbnailPath = await getThumbnailWithPath(tempVideoPath)
-                await unlinkAsync(tempVideoPath);
-
-                resolve(thumbnailPath);
-            } catch (err) {
-                reject(err);
-            }
-        })
-    } catch (err) {
-        console.error('getThumbnailWithUrl | Error: ', err.stack);
-        throw err;
     }
 
+    async getVideoThumbnail(videoPathOrUrl) {
+        try {
+            const isUrl = videoPathOrUrl.startsWith('http');
+            if (isUrl) {
+                return this.getVideoThumbnailWithUrl(videoPathOrUrl);
+            } else {
+                return this.getVideoThumbnailWithPath(videoPathOrUrl);
+            }
+        } catch (err) {
+            console.error('getVideoThumbnail | Error generating thumbnail: ', err);
+            throw err;
+        }
+    }
+
+    async queueGetVideoThumbnail(videoPathOrUrl) {
+        return new Promise((resolve, reject) => {
+            this.queue.push(() => this.getVideoThumbnail(videoPathOrUrl), (err, result) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(result);
+                }
+            });
+        });
+    }
 }
+
+export default ThumbnailGenerator;
