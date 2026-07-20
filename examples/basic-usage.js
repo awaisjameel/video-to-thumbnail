@@ -10,3 +10,12 @@ for (const videoPathOrUrl of [localVideoPath, remoteVideoUrl]) {
   const thumbnailPath = await thumbnailGenerator.getVideoThumbnail(videoPathOrUrl);
   console.log(`${videoPathOrUrl} -> ${thumbnailPath}`);
 }
+
+// Per-call overrides: capture a specific frame, resize it, and control the
+// exact output filename instead of the default auto-generated one.
+const customThumbnailPath = await thumbnailGenerator.getVideoThumbnail(localVideoPath, {
+  timestamp: '50%',
+  size: '320x?', // fixed width, aspect-ratio-preserving height
+  filename: 'sample-video-preview.png',
+});
+console.log(`custom options -> ${customThumbnailPath}`);

@@ -3,8 +3,9 @@ import { mkdtemp, open, readdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ffmpeg from 'fluent-ffmpeg';
 import { ThumbnailGenerator } from '../src/ThumbnailGenerator.js';
-import { ThumbnailDownloadError } from '../src/errors.js';
+import { ThumbnailDownloadError, ThumbnailGenerationError } from '../src/errors.js';
 
 const fixtureVideoPath = fileURLToPath(new URL('./fixtures/sample-video.mp4', import.meta.url));
 
@@ -51,6 +52,11 @@ describe('ThumbnailGenerator', () => {
   it('rejects a non-positive-integer concurrency', (t) => {
     t.assert.throws(() => new ThumbnailGenerator({ concurrency: 0 }), RangeError);
     t.assert.throws(() => new ThumbnailGenerator({ concurrency: 1.5 }), RangeError);
+  });
+
+  it('rejects a non-positive downloadTimeoutMs', (t) => {
+    t.assert.throws(() => new ThumbnailGenerator({ downloadTimeoutMs: 0 }), RangeError);
+    t.assert.throws(() => new ThumbnailGenerator({ downloadTimeoutMs: -1 }), RangeError);
   });
 
   it('generates a PNG thumbnail from a local video file', async (t) => {
@@ -121,5 +127,153 @@ describe('ThumbnailGenerator', () => {
     t.assert.ok(results[0].thumbnailPath);
     t.assert.equal(results[1].input, 'https://example.com/broken.mp4');
     t.assert.ok(results[1].error instanceof ThumbnailDownloadError);
+  });
+
+  it('rejects a non-array passed to getVideoThumbnails', async (t) => {
+    await t.assert.rejects(
+      () => generator.getVideoThumbnails(/** @type {any} */ (fixtureVideoPath)),
+      TypeError,
+    );
+  });
+
+  it('fails fast with a ThumbnailGenerationError for a missing local file, without invoking ffmpeg', async (t) => {
+    await t.assert.rejects(
+      () => generator.getVideoThumbnail(path.join(workDir, 'does-not-exist.mp4')),
+      (error) => {
+        t.assert.ok(error instanceof ThumbnailGenerationError);
+        t.assert.equal(error.code, 'THUMBNAIL_GENERATION_FAILED');
+        t.assert.match(error.message, /not found/i);
+        return true;
+      },
+    );
+  });
+
+  it('fails with a ThumbnailGenerationError when the local path is a directory', async (t) => {
+    await t.assert.rejects(
+      () => generator.getVideoThumbnail(workDir),
+      (error) => {
+        t.assert.ok(error instanceof ThumbnailGenerationError);
+        t.assert.match(error.message, /not a regular file/i);
+        return true;
+      },
+    );
+  });
+
+  it('writes to an exact filename when options.filename is given, with no random suffix', async (t) => {
+    const thumbnailPath = await generator.getVideoThumbnail(fixtureVideoPath, { filename: 'exact.png' });
+    t.assert.equal(thumbnailPath, path.join(workDir, 'thumbnails', 'exact.png'));
+    await assertIsPng(thumbnailPath);
+  });
+
+  it('rejects options.filename containing a directory separator', async (t) => {
+    await t.assert.rejects(
+      () => generator.getVideoThumbnail(fixtureVideoPath, { filename: '../escape.png' }),
+      TypeError,
+    );
+  });
+
+  it('rejects options.filename without a .png extension', async (t) => {
+    await t.assert.rejects(
+      () => generator.getVideoThumbnail(fixtureVideoPath, { filename: 'exact.jpg' }),
+      TypeError,
+    );
+  });
+
+  it('resolves a percentage timestamp (requires ffprobe to read the video duration)', async (t) => {
+    const thumbnailPath = await generator.getVideoThumbnail(fixtureVideoPath, {
+      timestamp: '50%',
+      filename: 'percentage-timestamp.png',
+    });
+    await assertIsPng(thumbnailPath);
+  });
+
+  it('applies a per-call size override', async (t) => {
+    const thumbnailPath = await generator.getVideoThumbnail(fixtureVideoPath, {
+      filename: 'resized.png',
+      size: '80x?',
+    });
+    await assertIsPng(thumbnailPath);
+  });
+
+  it('rejects an already-aborted signal without doing any work', async (t) => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await t.assert.rejects(
+      () => generator.getVideoThumbnail(fixtureVideoPath, { signal: controller.signal }),
+      (error) => {
+        t.assert.equal(error.name, 'AbortError');
+        return true;
+      },
+    );
+  });
+
+  it('aborts an in-flight ffmpeg run via signal', async (t) => {
+    const controller = new AbortController();
+    const promise = generator.getVideoThumbnail(fixtureVideoPath, {
+      signal: controller.signal,
+      filename: 'aborted.png',
+    });
+    setTimeout(() => controller.abort(), 5);
+
+    await t.assert.rejects(promise, (error) => {
+      t.assert.equal(error.name, 'AbortError');
+      return true;
+    });
+  });
+
+  it('aborts an in-flight download via signal', async (t) => {
+    t.mock.method(globalThis, 'fetch', (url, opts) => {
+      return new Promise((_resolve, reject) => {
+        opts.signal.addEventListener('abort', () => reject(opts.signal.reason));
+      });
+    });
+
+    const controller = new AbortController();
+    const promise = generator.getVideoThumbnail('https://example.com/videos/slow.mp4', {
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 5);
+
+    await t.assert.rejects(promise, (error) => {
+      t.assert.equal(error.name, 'AbortError');
+      return true;
+    });
+  });
+
+  it('does not clobber an explicit ffmpegPath set by an earlier instance when a later instance uses defaults', (t) => {
+    const calls = t.mock.method(ffmpeg, 'setFfmpegPath');
+
+    new ThumbnailGenerator({
+      thumbsDir: path.join(workDir, 'a'),
+      tempDir: path.join(workDir, 'a-temp'),
+      ffmpegPath: '/custom/ffmpeg-binary',
+    });
+    calls.mock.resetCalls();
+
+    new ThumbnailGenerator({
+      thumbsDir: path.join(workDir, 'b'),
+      tempDir: path.join(workDir, 'b-temp'),
+    });
+
+    t.assert.equal(calls.mock.callCount(), 0);
+  });
+
+  it('does not clobber an explicit ffprobePath set by an earlier instance when a later instance uses defaults', (t) => {
+    const calls = t.mock.method(ffmpeg, 'setFfprobePath');
+
+    new ThumbnailGenerator({
+      thumbsDir: path.join(workDir, 'c'),
+      tempDir: path.join(workDir, 'c-temp'),
+      ffprobePath: '/custom/ffprobe-binary',
+    });
+    calls.mock.resetCalls();
+
+    new ThumbnailGenerator({
+      thumbsDir: path.join(workDir, 'd'),
+      tempDir: path.join(workDir, 'd-temp'),
+    });
+
+    t.assert.equal(calls.mock.callCount(), 0);
   });
 });
