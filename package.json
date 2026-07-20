@@ -1,17 +1,70 @@
 {
-    "name": "url-to-image",
-    "version": "1.0.0",
-    "description": "Generate thumbnails from video URLs",
-    "main": "index.js",
-    "type": "module",
-    "scripts": {
-        "start": "node index.js"
-    },
-    "dependencies": {
-        "@ffmpeg-installer/ffmpeg": "^1.1.0",
-        "async": "^3.2.5",
-        "axios": "^1.3.4",
-        "dotenv": "^16.4.5",
-        "fluent-ffmpeg": "^2.1.3"
+  "name": "video-to-thumbnail",
+  "version": "1.0.0",
+  "packageManager": "pnpm@10.28.2",
+  "description": "Generate PNG thumbnails from local video files or remote video URLs using ffmpeg, with built-in concurrency control.",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./src/index.js"
     }
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.12.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "test:watch": "node --test --watch",
+    "test:coverage": "node --test --experimental-test-coverage",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "rimraf dist && tsc -p tsconfig.json",
+    "example": "node examples/basic-usage.js",
+    "example:concurrent": "node examples/concurrent-usage.js",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "video",
+    "thumbnail",
+    "ffmpeg",
+    "screenshot",
+    "poster",
+    "preview",
+    "mp4",
+    "image",
+    "frame"
+  ],
+  "author": {
+    "name": "awaisjameel",
+    "email": "awais.jameel@ymail.com",
+    "url": "https://github.com/awaisjameel"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/awaisjameel/video-to-thumbnail.git"
+  },
+  "bugs": {
+    "url": "https://github.com/awaisjameel/video-to-thumbnail/issues"
+  },
+  "homepage": "https://github.com/awaisjameel/video-to-thumbnail#readme",
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "p-limit": "^7.3.0"
+  },
+  "devDependencies": {
+    "@types/fluent-ffmpeg": "^2.1.28",
+    "@types/node": "^26.1.1",
+    "rimraf": "^6.0.1",
+    "typescript": "^7.0.2"
+  }
 }

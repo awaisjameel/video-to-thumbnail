@@ -1,5 +1,16 @@
 node_modules
-pnpm-lock.yaml
 
-temp
-thumbnails
+# Build output
+dist
+dist-typecheck
+
+# Test coverage
+coverage
+
+# Local environment overrides
+.env
+.env.local
+
+# Generated at runtime by ThumbnailGenerator's default options
+/thumbnails
+/temp
