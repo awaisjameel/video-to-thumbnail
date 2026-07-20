@@ -1,6 +1,5 @@
 {
   "name": "video-to-thumbnail",
-  "version": "1.0.0",
   "packageManager": "pnpm@10.28.2",
   "description": "Generate PNG thumbnails from local video files or remote video URLs using ffmpeg, with built-in concurrency control.",
   "type": "module",
