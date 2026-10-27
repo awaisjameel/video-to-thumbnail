@@ -26,7 +26,7 @@
     "node": "^22.18.0 || ^24.11.0 || ^26.0.0"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "node --test --test-timeout=60000",
     "test:watch": "node --test --watch",
     "test:coverage": "node --test --experimental-test-coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",
