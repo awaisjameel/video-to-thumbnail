@@ -1,16 +1,13 @@
 import path from 'node:path';
-import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, rename, rm, stat } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
-import ffmpeg from 'fluent-ffmpeg';
-import { path as bundledFfmpegPath } from '@ffmpeg-installer/ffmpeg';
-import { path as bundledFfprobePath } from '@ffprobe-installer/ffprobe';
 import pLimit from 'p-limit';
+import { parseTimestamp, resolveTimestamp, runMediaTool, scaleFilter } from './media.js';
 import { ThumbnailDownloadError, ThumbnailGenerationError } from './errors.js';
 import {
   baseNameFromUrl,
-  extensionFromPath,
   extensionFromUrl,
   isHttpUrl,
   sanitizeBaseName,
@@ -52,15 +49,8 @@ export class ThumbnailGenerator {
    * @param {string} [options.timestamp] Default ffmpeg timemark (seconds, or `"50%"`-style percentage) to capture the frame from. Default: `"1"`. Overridable per call.
    * @param {string} [options.size] Default ffmpeg size spec for the output frame (e.g. `"320x240"`). Default: source resolution. Overridable per call.
    * @param {number} [options.downloadTimeoutMs] Abort downloads that take longer than this. Default: `30000`.
-   * @param {string} [options.ffmpegPath] Path to an ffmpeg binary. Defaults to the one bundled via `@ffmpeg-installer/ffmpeg`.
-   *   Note: fluent-ffmpeg caches this path at the module level, so setting it applies process-wide. To limit the blast
-   *   radius, this constructor only touches that global path when it's the first `ThumbnailGenerator` created in the
-   *   process, or when `ffmpegPath` is explicitly passed — plain default instances created afterward never clobber an
-   *   explicit choice made by an earlier instance. Two *different* explicit `ffmpegPath` values in the same process
-   *   still conflict (last one wins for everybody); run those in separate processes/workers if you need both.
-   * @param {string} [options.ffprobePath] Path to an ffprobe binary, used only to resolve percentage-style `timestamp`
-   *   values (e.g. `"50%"`) to an absolute time. Defaults to the one bundled via `@ffprobe-installer/ffprobe`. Subject
-   *   to the same process-wide caching behavior, and the same mitigation, as `ffmpegPath`.
+   * @param {string} [options.ffmpegPath] Path to an ffmpeg executable. Default: `ffmpeg` on PATH. This setting is per instance.
+   * @param {string} [options.ffprobePath] Path to an ffprobe executable, needed for percentage timestamps. Default: `ffprobe` on PATH. This setting is per instance.
    */
   constructor(options = {}) {
     const {
@@ -74,11 +64,25 @@ export class ThumbnailGenerator {
       ffprobePath,
     } = options;
 
-    if (!Number.isInteger(concurrency) || concurrency < 1) {
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
       throw new RangeError('options.concurrency must be a positive integer');
     }
-    if (!Number.isFinite(downloadTimeoutMs) || downloadTimeoutMs <= 0) {
-      throw new RangeError('options.downloadTimeoutMs must be a positive number');
+    if (
+      !Number.isSafeInteger(downloadTimeoutMs) ||
+      downloadTimeoutMs <= 0 ||
+      downloadTimeoutMs > 4_294_967_295
+    ) {
+      throw new RangeError(
+        'options.downloadTimeoutMs must be a positive integer no greater than 4294967295',
+      );
+    }
+    parseTimestamp(timestamp);
+    scaleFilter(size);
+    if (
+      (ffmpegPath !== undefined && (typeof ffmpegPath !== 'string' || !ffmpegPath.trim())) ||
+      (ffprobePath !== undefined && (typeof ffprobePath !== 'string' || !ffprobePath.trim()))
+    ) {
+      throw new TypeError('Executable paths must be non-empty strings');
     }
 
     this.thumbsDir = path.resolve(thumbsDir);
@@ -86,28 +90,11 @@ export class ThumbnailGenerator {
     this.timestamp = timestamp;
     this.size = size;
     this.downloadTimeoutMs = downloadTimeoutMs;
-    this.ffmpegPath = ffmpegPath ?? bundledFfmpegPath;
-    this.ffprobePath = ffprobePath ?? bundledFfprobePath;
+    this.ffmpegPath = ffmpegPath ?? 'ffmpeg';
+    this.ffprobePath = ffprobePath ?? 'ffprobe';
 
     this.#limit = pLimit(concurrency);
-
-    // fluent-ffmpeg has no per-instance concept of the ffmpeg/ffprobe binary paths (see the
-    // doc comments above): it caches whatever's passed in shared, process-global state. We
-    // only mutate that global when this instance explicitly asked for a specific binary, or
-    // when nothing has configured it yet, so later default-option instances never silently
-    // override an earlier instance's explicit choice.
-    if (ffmpegPath !== undefined || !ThumbnailGenerator.#ffmpegPathConfigured) {
-      ffmpeg.setFfmpegPath(this.ffmpegPath);
-      ThumbnailGenerator.#ffmpegPathConfigured = true;
-    }
-    if (ffprobePath !== undefined || !ThumbnailGenerator.#ffprobePathConfigured) {
-      ffmpeg.setFfprobePath(this.ffprobePath);
-      ThumbnailGenerator.#ffprobePathConfigured = true;
-    }
   }
-
-  static #ffmpegPathConfigured = false;
-  static #ffprobePathConfigured = false;
 
   /**
    * Generates a thumbnail for a single local file path or `http(s)` URL,
@@ -117,8 +104,35 @@ export class ThumbnailGenerator {
    * @returns {Promise<string>} Absolute filesystem path to the generated PNG.
    */
   async getVideoThumbnail(videoPathOrUrl, options = {}) {
-    options.signal?.throwIfAborted();
-    return this.#limit(() => this.#generateFromInput(videoPathOrUrl, options));
+    const { signal } = options;
+    signal?.throwIfAborted();
+    let started = false;
+    const work = this.#limit(() => {
+      started = true;
+      return this.#generateFromInput(videoPathOrUrl, options);
+    });
+    if (!signal) return work;
+    return new Promise((resolve, reject) => {
+      const cleanup = () => signal.removeEventListener('abort', onAbort);
+      const onAbort = () => {
+        if (!started) {
+          cleanup();
+          reject(signal.reason);
+        }
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      void work.then(
+        (value) => {
+          cleanup();
+          resolve(value);
+        },
+        (error) => {
+          cleanup();
+          reject(error);
+        },
+      );
+    });
   }
 
   /**
@@ -140,6 +154,11 @@ export class ThumbnailGenerator {
   async getVideoThumbnails(videoPathsOrUrls, options = {}) {
     if (!Array.isArray(videoPathsOrUrls)) {
       throw new TypeError('videoPathsOrUrls must be an array of strings');
+    }
+    if (options.filename !== undefined && videoPathsOrUrls.length > 1) {
+      throw new TypeError(
+        'A batch cannot share one output filename; use distinct per-call filenames',
+      );
     }
 
     const settled = await Promise.allSettled(
@@ -176,7 +195,7 @@ export class ThumbnailGenerator {
     try {
       return await this.#generateThumbnail(tempVideoPath, options);
     } finally {
-      await rm(downloadDir, { recursive: true, force: true });
+      await this.#removeTemporaryDirectory(downloadDir, this.downloadsDir, 'dl-');
     }
   }
 
@@ -194,7 +213,9 @@ export class ThumbnailGenerator {
       throw new ThumbnailGenerationError(`Video file not found at ${videoLocalPath}`, { cause });
     }
     if (!info.isFile()) {
-      throw new ThumbnailGenerationError(`Expected a video file at ${videoLocalPath}, but it is not a regular file`);
+      throw new ThumbnailGenerationError(
+        `Expected a video file at ${videoLocalPath}, but it is not a regular file`,
+      );
     }
   }
 
@@ -208,55 +229,51 @@ export class ThumbnailGenerator {
   async #downloadToTempFile(videoUrl, signal) {
     await this.#ensureDir(this.downloadsDir);
     const downloadDir = await mkdtemp(path.join(this.downloadsDir, 'dl-'));
-
-    const ext = extensionFromUrl(videoUrl);
-    const baseName = sanitizeBaseName(baseNameFromUrl(videoUrl));
-    const tempVideoPath = path.join(downloadDir, ext ? `${baseName}.${ext}` : baseName);
-
-    const timeoutSignal = AbortSignal.timeout(this.downloadTimeoutMs);
-    const combinedSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
-
-    let response;
+    /** @type {AbortSignal | undefined} */
+    let timeoutSignal;
+    let saving = false;
     try {
-      response = await fetch(videoUrl, { signal: combinedSignal });
-    } catch (cause) {
-      await rm(downloadDir, { recursive: true, force: true });
-      if (signal?.aborted) throw signal.reason;
-      const timedOut = cause instanceof Error && cause.name === 'TimeoutError';
-      throw new ThumbnailDownloadError(
-        timedOut
-          ? `Timed out after ${this.downloadTimeoutMs}ms downloading video from ${videoUrl}`
-          : `Failed to fetch video from ${videoUrl}`,
-        { cause },
-      );
-    }
-
-    if (!response.ok || !response.body) {
-      await rm(downloadDir, { recursive: true, force: true });
-      throw new ThumbnailDownloadError(
-        `Failed to download video from ${videoUrl}: HTTP ${response.status} ${response.statusText}`,
-      );
-    }
-
-    try {
+      const ext = extensionFromUrl(videoUrl);
+      const baseName = sanitizeBaseName(baseNameFromUrl(videoUrl));
+      const tempVideoPath = path.join(downloadDir, ext ? `${baseName}.${ext}` : baseName);
+      timeoutSignal = AbortSignal.timeout(this.downloadTimeoutMs);
+      const combinedSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
+      const response = await fetch(videoUrl, { signal: combinedSignal });
+      if (!response.ok || !response.body) {
+        await response.body?.cancel();
+        throw new ThumbnailDownloadError(
+          `Failed to download video from ${videoUrl}: HTTP ${response.status} ${response.statusText}`,
+        );
+      }
+      saving = true;
       await pipeline(Readable.fromWeb(response.body), createWriteStream(tempVideoPath), {
         signal: combinedSignal,
       });
+      return { tempVideoPath, downloadDir };
     } catch (cause) {
-      await rm(downloadDir, { recursive: true, force: true });
+      await this.#removeTemporaryDirectory(downloadDir, this.downloadsDir, 'dl-');
       if (signal?.aborted) throw signal.reason;
-      const timedOut = cause instanceof Error && cause.name === 'TimeoutError';
+      if (cause instanceof ThumbnailDownloadError) throw cause;
       throw new ThumbnailDownloadError(
-        timedOut
+        timeoutSignal?.aborted
           ? `Timed out after ${this.downloadTimeoutMs}ms downloading video from ${videoUrl}`
-          : `Failed to save downloaded video from ${videoUrl}`,
-        { cause },
+          : `Failed to ${saving ? 'save downloaded' : 'fetch'} video from ${videoUrl}`,
+        { cause: timeoutSignal?.aborted ? timeoutSignal.reason : cause },
       );
     }
-
-    return { tempVideoPath, downloadDir };
   }
 
+  /**
+   * @param {string} directory
+   * @param {string} parent
+   * @param {string} prefix
+   */
+  async #removeTemporaryDirectory(directory, parent, prefix) {
+    if (path.dirname(directory) !== parent || !path.basename(directory).startsWith(prefix)) {
+      throw new Error('Refusing to remove a directory outside its temporary parent');
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
   /**
    * Extracts a single frame from `videoLocalPath` and writes it as a PNG
    * into {@link thumbsDir}.
@@ -267,49 +284,78 @@ export class ThumbnailGenerator {
   async #generateThumbnail(videoLocalPath, options) {
     const { signal, timestamp = this.timestamp, size = this.size, filename } = options;
     signal?.throwIfAborted();
-
+    parseTimestamp(timestamp);
+    const filter = scaleFilter(size);
+    const thumbnailFilename =
+      filename !== undefined
+        ? this.#validateCustomFilename(filename)
+        : `${sanitizeBaseName(path.basename(videoLocalPath, path.extname(videoLocalPath)))}-${uniqueSuffix()}.png`;
     await this.#ensureDir(this.thumbsDir);
-
-    const thumbnailFilename = filename
-      ? this.#validateCustomFilename(filename)
-      : `${sanitizeBaseName(path.basename(videoLocalPath, path.extname(videoLocalPath)))}-${uniqueSuffix()}.png`;
-
-    const ext = extensionFromPath(videoLocalPath);
-
-    return new Promise((resolve, reject) => {
-      const command = ffmpeg(videoLocalPath);
-      if (ext) {
-        command.inputFormat(ext);
+    const stagingDir = await mkdtemp(path.join(this.thumbsDir, '.thumb-'));
+    const temporaryOutput = path.join(stagingDir, 'frame.png');
+    const thumbnailPath = path.join(this.thumbsDir, thumbnailFilename);
+    try {
+      const seconds = await resolveTimestamp(
+        timestamp,
+        path.resolve(videoLocalPath),
+        this.ffprobePath,
+        signal,
+      );
+      await runMediaTool(
+        this.ffmpegPath,
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-nostdin',
+          '-y',
+          '-ss',
+          String(seconds),
+          '-i',
+          path.resolve(videoLocalPath),
+          '-map',
+          '0:v:0',
+          '-frames:v',
+          '1',
+          '-an',
+          '-sn',
+          '-dn',
+          ...(filter ? ['-vf', filter] : []),
+          '-c:v',
+          'png',
+          '-threads',
+          '1',
+          '-f',
+          'image2',
+          '-update',
+          '1',
+          temporaryOutput,
+        ],
+        signal,
+      );
+      const handle = await open(temporaryOutput, 'r');
+      try {
+        const header = Buffer.alloc(8);
+        const { bytesRead } = await handle.read(header, 0, 8, 0);
+        if (bytesRead !== 8 || !header.equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+          throw new Error('FFmpeg did not produce a PNG frame at the requested timestamp');
+        }
+      } finally {
+        await handle.close();
       }
-
-      const onAbort = () => command.kill('SIGKILL');
-      signal?.addEventListener('abort', onAbort, { once: true });
-      const stopWatchingAbort = () => signal?.removeEventListener('abort', onAbort);
-
-      command
-        .on('end', () => {
-          stopWatchingAbort();
-          resolve(path.join(this.thumbsDir, thumbnailFilename));
-        })
-        .on('error', (cause) => {
-          stopWatchingAbort();
-          if (signal?.aborted) {
-            reject(signal.reason);
-            return;
-          }
-          reject(
-            new ThumbnailGenerationError(`Failed to generate thumbnail for ${videoLocalPath}`, { cause }),
-          );
-        })
-        .screenshots({
-          timemarks: [timestamp],
-          folder: this.thumbsDir,
-          filename: thumbnailFilename,
-          ...(size ? { size } : {}),
-        });
-    });
+      signal?.throwIfAborted();
+      await rename(temporaryOutput, thumbnailPath);
+      return thumbnailPath;
+    } catch (cause) {
+      if (signal?.aborted) throw signal.reason;
+      throw new ThumbnailGenerationError(
+        `Failed to generate thumbnail for ${videoLocalPath}. Ensure FFmpeg/FFprobe are installed or configure their executable paths.`,
+        { cause },
+      );
+    } finally {
+      await this.#removeTemporaryDirectory(stagingDir, this.thumbsDir, '.thumb-');
+    }
   }
-
   /**
    * @param {string} filename
    * @returns {string}
@@ -318,8 +364,16 @@ export class ThumbnailGenerator {
     if (typeof filename !== 'string' || filename.length === 0) {
       throw new TypeError('options.filename must be a non-empty string');
     }
-    if (path.basename(filename) !== filename) {
-      throw new TypeError('options.filename must be a bare filename, not a path (no directory separators)');
+    if (
+      path.basename(filename) !== filename ||
+      // Control characters and reserved punctuation are invalid in portable filenames.
+      // oxlint-disable-next-line no-control-regex
+      /[\\/:<>"|?*\x00-\x1f]/.test(filename) ||
+      /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])\./i.test(filename)
+    ) {
+      throw new TypeError(
+        'options.filename must be a bare filename, not a path (no directory separators)',
+      );
     }
     if (path.extname(filename).toLowerCase() !== '.png') {
       throw new TypeError('options.filename must end with ".png"');

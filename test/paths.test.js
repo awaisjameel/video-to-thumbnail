@@ -22,14 +22,17 @@ describe('isHttpUrl', () => {
   });
 
   it('rejects non-string input without throwing', (t) => {
-    t.assert.equal(isHttpUrl(/** @type {any} */ (null)), false);
-    t.assert.equal(isHttpUrl(/** @type {any} */ (undefined)), false);
+    t.assert.equal(isHttpUrl(null), false);
+    t.assert.equal(isHttpUrl(undefined), false);
   });
 });
 
 describe('extensionFromUrl', () => {
   it('ignores query strings and fragments', (t) => {
-    t.assert.equal(extensionFromUrl('https://cdn.example.com/videos/clip.mp4?sig=xyz&exp=123'), 'mp4');
+    t.assert.equal(
+      extensionFromUrl('https://cdn.example.com/videos/clip.mp4?sig=xyz&exp=123'),
+      'mp4',
+    );
     t.assert.equal(extensionFromUrl('https://cdn.example.com/videos/clip.MOV#t=10'), 'mov');
   });
 
@@ -46,7 +49,10 @@ describe('extensionFromPath', () => {
 
 describe('baseNameFromUrl', () => {
   it('extracts the filename without extension', (t) => {
-    t.assert.equal(baseNameFromUrl('https://cdn.example.com/videos/my-clip.mp4?sig=xyz'), 'my-clip');
+    t.assert.equal(
+      baseNameFromUrl('https://cdn.example.com/videos/my-clip.mp4?sig=xyz'),
+      'my-clip',
+    );
   });
 });
 

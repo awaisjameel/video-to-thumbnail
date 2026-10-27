@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
-import { mkdtemp, open, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { copyFile, mkdtemp, open, readdir, readFile, rm, stat } from 'node:fs/promises';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import ffmpeg from 'fluent-ffmpeg';
 import { ThumbnailGenerator } from '../src/ThumbnailGenerator.js';
 import { ThumbnailDownloadError, ThumbnailGenerationError } from '../src/errors.js';
 
@@ -57,6 +57,8 @@ describe('ThumbnailGenerator', () => {
   it('rejects a non-positive downloadTimeoutMs', (t) => {
     t.assert.throws(() => new ThumbnailGenerator({ downloadTimeoutMs: 0 }), RangeError);
     t.assert.throws(() => new ThumbnailGenerator({ downloadTimeoutMs: -1 }), RangeError);
+    t.assert.throws(() => new ThumbnailGenerator({ downloadTimeoutMs: 1.5 }), RangeError);
+    t.assert.throws(() => new ThumbnailGenerator({ downloadTimeoutMs: 2 ** 32 }), RangeError);
   });
 
   it('generates a PNG thumbnail from a local video file', async (t) => {
@@ -77,9 +79,15 @@ describe('ThumbnailGenerator', () => {
 
   it('downloads a remote URL, generates a thumbnail, and cleans up the temp download', async (t) => {
     const videoBuffer = await readFile(fixtureVideoPath);
-    t.mock.method(globalThis, 'fetch', async () => new Response(videoBuffer, { status: 200, statusText: 'OK' }));
+    t.mock.method(
+      globalThis,
+      'fetch',
+      async () => new Response(videoBuffer, { status: 200, statusText: 'OK' }),
+    );
 
-    const thumbnailPath = await generator.getVideoThumbnail('https://example.com/videos/sample-video.mp4?sig=abc');
+    const thumbnailPath = await generator.getVideoThumbnail(
+      'https://example.com/videos/sample-video.mp4?sig=abc',
+    );
     await assertIsPng(thumbnailPath);
 
     const downloadsDir = path.join(workDir, 'temp', 'downloads');
@@ -88,7 +96,11 @@ describe('ThumbnailGenerator', () => {
   });
 
   it('wraps a non-2xx download response in a ThumbnailDownloadError', async (t) => {
-    t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 404, statusText: 'Not Found' }));
+    t.mock.method(
+      globalThis,
+      'fetch',
+      async () => new Response(null, { status: 404, statusText: 'Not Found' }),
+    );
 
     await t.assert.rejects(
       () => generator.getVideoThumbnail('https://example.com/videos/missing.mp4'),
@@ -118,9 +130,16 @@ describe('ThumbnailGenerator', () => {
   });
 
   it('getVideoThumbnails is fault-tolerant across a mixed batch', async (t) => {
-    t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 500, statusText: 'Server Error' }));
+    t.mock.method(
+      globalThis,
+      'fetch',
+      async () => new Response(null, { status: 500, statusText: 'Server Error' }),
+    );
 
-    const results = await generator.getVideoThumbnails([fixtureVideoPath, 'https://example.com/broken.mp4']);
+    const results = await generator.getVideoThumbnails([
+      fixtureVideoPath,
+      'https://example.com/broken.mp4',
+    ]);
 
     t.assert.equal(results.length, 2);
     t.assert.equal(results[0].input, fixtureVideoPath);
@@ -131,7 +150,8 @@ describe('ThumbnailGenerator', () => {
 
   it('rejects a non-array passed to getVideoThumbnails', async (t) => {
     await t.assert.rejects(
-      () => generator.getVideoThumbnails(/** @type {any} */ (fixtureVideoPath)),
+      // @ts-expect-error Exercise runtime validation of an invalid argument.
+      () => generator.getVideoThumbnails(fixtureVideoPath),
       TypeError,
     );
   });
@@ -160,7 +180,9 @@ describe('ThumbnailGenerator', () => {
   });
 
   it('writes to an exact filename when options.filename is given, with no random suffix', async (t) => {
-    const thumbnailPath = await generator.getVideoThumbnail(fixtureVideoPath, { filename: 'exact.png' });
+    const thumbnailPath = await generator.getVideoThumbnail(fixtureVideoPath, {
+      filename: 'exact.png',
+    });
     t.assert.equal(thumbnailPath, path.join(workDir, 'thumbnails', 'exact.png'));
     await assertIsPng(thumbnailPath);
   });
@@ -179,7 +201,7 @@ describe('ThumbnailGenerator', () => {
     );
   });
 
-  it('resolves a percentage timestamp (requires ffprobe to read the video duration)', async (t) => {
+  it('resolves a percentage timestamp (requires ffprobe to read the video duration)', async () => {
     const thumbnailPath = await generator.getVideoThumbnail(fixtureVideoPath, {
       timestamp: '50%',
       filename: 'percentage-timestamp.png',
@@ -193,6 +215,108 @@ describe('ThumbnailGenerator', () => {
       size: '80x?',
     });
     await assertIsPng(thumbnailPath);
+    const png = await readFile(thumbnailPath);
+    t.assert.equal(png.readUInt32BE(16), 80);
+  });
+
+  it('detects the input format from content even when the extension is unknown', async () => {
+    const video = path.join(workDir, 'media.unknown');
+    await copyFile(fixtureVideoPath, video);
+    await assertIsPng(await generator.getVideoThumbnail(video));
+  });
+
+  it('preserves an existing output when no frame exists at the requested timestamp', async (t) => {
+    const preview = await generator.getVideoThumbnail(fixtureVideoPath, {
+      filename: 'preview.png',
+    });
+    const original = await readFile(preview);
+    await t.assert.rejects(
+      generator.getVideoThumbnail(fixtureVideoPath, {
+        filename: 'preview.png',
+        timestamp: '10000',
+      }),
+      ThumbnailGenerationError,
+    );
+    t.assert.deepEqual(await readFile(preview), original);
+    t.assert.deepEqual(await readdir(path.dirname(preview)), ['preview.png']);
+  });
+
+  it('rejects a shared batch filename', async (t) => {
+    await t.assert.rejects(
+      generator.getVideoThumbnails([fixtureVideoPath, fixtureVideoPath], {
+        filename: 'collision.png',
+      }),
+      TypeError,
+    );
+  });
+
+  it('rejects empty and non-portable custom filenames', async (t) => {
+    for (const filename of [
+      '',
+      '..\\escape.png',
+      'CON.png',
+      'folder/file.png',
+      'a<b.png',
+      'a>b.png',
+      'a"b.png',
+      'a|b.png',
+      'a?b.png',
+      'a*b.png',
+    ]) {
+      await t.assert.rejects(
+        generator.getVideoThumbnail(fixtureVideoPath, { filename }),
+        TypeError,
+      );
+    }
+  });
+
+  it('bounds concurrent remote work across direct calls', async (t) => {
+    const video = await readFile(fixtureVideoPath);
+    let active = 0;
+    let maximum = 0;
+    t.mock.method(globalThis, 'fetch', async () => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      active -= 1;
+      return new Response(video);
+    });
+    await Promise.all(
+      Array.from({ length: 4 }, (_, index) =>
+        generator.getVideoThumbnail(`https://example.com/${index}.mp4`),
+      ),
+    );
+    t.assert.equal(maximum, 2);
+  });
+
+  it('streams real HTTP downloads and cleans up timed-out response bodies', async (t) => {
+    const video = await readFile(fixtureVideoPath);
+    const server = http.createServer((request, response) => {
+      response.writeHead(200, { 'Content-Type': 'video/mp4' });
+      if (request.url === '/slow') response.write(video.subarray(0, 16));
+      else response.end(video);
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    try {
+      await assertIsPng(await generator.getVideoThumbnail(`${baseUrl}/success`));
+      const short = new ThumbnailGenerator({
+        thumbsDir: path.join(workDir, 'short'),
+        tempDir: path.join(workDir, 'short-temp'),
+        downloadTimeoutMs: 100,
+      });
+      await t.assert.rejects(
+        short.getVideoThumbnail(`${baseUrl}/slow`),
+        (error) => error instanceof ThumbnailDownloadError && error.cause.name === 'TimeoutError',
+      );
+      t.assert.deepEqual(await readdir(short.downloadsDir), []);
+    } finally {
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+        server.closeAllConnections();
+      });
+    }
   });
 
   it('rejects an already-aborted signal without doing any work', async (t) => {
@@ -241,39 +365,66 @@ describe('ThumbnailGenerator', () => {
     });
   });
 
-  it('does not clobber an explicit ffmpegPath set by an earlier instance when a later instance uses defaults', (t) => {
-    const calls = t.mock.method(ffmpeg, 'setFfmpegPath');
-
-    new ThumbnailGenerator({
-      thumbsDir: path.join(workDir, 'a'),
-      tempDir: path.join(workDir, 'a-temp'),
-      ffmpegPath: '/custom/ffmpeg-binary',
+  it('cancels queued work promptly without waiting for the running job', async (t) => {
+    const video = await readFile(fixtureVideoPath);
+    let release;
+    let notifyStarted;
+    const gate = new Promise((resolve) => {
+      release = resolve;
     });
-    calls.mock.resetCalls();
-
-    new ThumbnailGenerator({
-      thumbsDir: path.join(workDir, 'b'),
-      tempDir: path.join(workDir, 'b-temp'),
+    const started = new Promise((resolve) => {
+      notifyStarted = resolve;
     });
-
-    t.assert.equal(calls.mock.callCount(), 0);
+    t.mock.method(globalThis, 'fetch', async () => {
+      notifyStarted();
+      await gate;
+      return new Response(video);
+    });
+    const serial = new ThumbnailGenerator({
+      concurrency: 1,
+      thumbsDir: path.join(workDir, 'serial'),
+      tempDir: path.join(workDir, 'serial-temp'),
+    });
+    const running = serial.getVideoThumbnail('https://example.com/running.mp4');
+    await started;
+    const controller = new AbortController();
+    const reason = new Error('queued cancellation');
+    const queued = serial.getVideoThumbnail(fixtureVideoPath, { signal: controller.signal });
+    controller.abort(reason);
+    let timer;
+    try {
+      await t.assert.rejects(
+        Promise.race([
+          queued,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('queued cancellation waited for the running job')),
+              100,
+            );
+          }),
+        ]),
+        (error) => error === reason,
+      );
+    } finally {
+      clearTimeout(timer);
+      release();
+      await running;
+    }
   });
 
-  it('does not clobber an explicit ffprobePath set by an earlier instance when a later instance uses defaults', (t) => {
-    const calls = t.mock.method(ffmpeg, 'setFfprobePath');
-
-    new ThumbnailGenerator({
-      thumbsDir: path.join(workDir, 'c'),
-      tempDir: path.join(workDir, 'c-temp'),
-      ffprobePath: '/custom/ffprobe-binary',
+  it('keeps executable paths independent between generator instances', async (t) => {
+    const broken = new ThumbnailGenerator({
+      thumbsDir: path.join(workDir, 'broken'),
+      ffmpegPath: path.join(workDir, 'missing-ffmpeg'),
+      ffprobePath: path.join(workDir, 'missing-ffprobe'),
     });
-    calls.mock.resetCalls();
-
-    new ThumbnailGenerator({
-      thumbsDir: path.join(workDir, 'd'),
-      tempDir: path.join(workDir, 'd-temp'),
-    });
-
-    t.assert.equal(calls.mock.callCount(), 0);
+    const working = new ThumbnailGenerator({ thumbsDir: path.join(workDir, 'working') });
+    await t.assert.rejects(broken.getVideoThumbnail(fixtureVideoPath), ThumbnailGenerationError);
+    await assertIsPng(await working.getVideoThumbnail(fixtureVideoPath));
+    await t.assert.rejects(
+      broken.getVideoThumbnail(fixtureVideoPath, { timestamp: '50%' }),
+      ThumbnailGenerationError,
+    );
+    await assertIsPng(await working.getVideoThumbnail(fixtureVideoPath, { timestamp: '50%' }));
   });
 });

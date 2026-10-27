@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
  * Returns `true` if `value` is an absolute `http:`/`https:` URL.
  * Anything else (a bare filesystem path, a relative path, `ftp://`, etc.)
  * is treated as a local path.
- * @param {string} value
+ * @param {unknown} value
  * @returns {boolean}
  */
 export function isHttpUrl(value) {
