@@ -12,7 +12,9 @@ const controller = new AbortController();
 setTimeout(() => controller.abort(), 5);
 
 try {
-  const thumbnailPath = await thumbnailGenerator.getVideoThumbnail(localVideoPath, { signal: controller.signal });
+  const thumbnailPath = await thumbnailGenerator.getVideoThumbnail(localVideoPath, {
+    signal: controller.signal,
+  });
   console.log(`not cancelled in time, generated: ${thumbnailPath}`);
 } catch (error) {
   // On abort, the promise rejects with the signal's own abort reason

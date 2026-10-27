@@ -1,6 +1,6 @@
 # video-to-thumbnail
 
-Generate PNG thumbnails from local video files or remote video URLs using [ffmpeg](https://ffmpeg.org/) — with built-in concurrency control, streamed downloads, cancellation, and zero required configuration.
+Generate PNG thumbnails from local video files or remote video URLs using [ffmpeg](https://ffmpeg.org/) — with built-in concurrency control, streamed downloads, cancellation, and per-instance executable settings.
 
 [![CI](https://github.com/awaisjameel/video-to-thumbnail/actions/workflows/ci.yml/badge.svg)](https://github.com/awaisjameel/video-to-thumbnail/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/video-to-thumbnail.svg)](https://www.npmjs.com/package/video-to-thumbnail)
@@ -10,21 +10,24 @@ Generate PNG thumbnails from local video files or remote video URLs using [ffmpe
 - **Bounded concurrency** per instance, so fanning out over hundreds of videos never spawns unbounded ffmpeg processes or downloads.
 - **Cancellable** — pass a standard `AbortSignal` to stop an in-flight download or ffmpeg run early.
 - **Fully customizable per call** — override the capture timestamp, resize the output, or pin an exact output filename, all without touching instance-wide defaults.
-- Ships **ffmpeg and ffprobe binaries** ([`@ffmpeg-installer/ffmpeg`](https://www.npmjs.com/package/@ffmpeg-installer/ffmpeg), [`@ffprobe-installer/ffprobe`](https://www.npmjs.com/package/@ffprobe-installer/ffprobe)) — no system install required, though you can point at your own. ffprobe is needed to resolve percentage-style timestamps (e.g. `"50%"`) to an absolute time.
-- **Zero configuration required** — sensible defaults, fully overridable.
+- Uses your **current FFmpeg and FFprobe installation**. Put them on PATH or set executable paths per instance. No deprecated wrappers or old bundled binaries.
+- Sensible generation defaults, fully overridable. Completed PNGs replace destinations atomically.
 - **Fails fast** with a typed error for missing/invalid local files, instead of spawning ffmpeg only to have it fail.
 - Ships **TypeScript declarations** generated from JSDoc, and typed error classes with stable `error.code` values.
-- Pure ESM, no CommonJS. Tested on Linux, macOS, and Windows.
+- Pure ESM, no CommonJS. CI targets Linux, macOS, and Windows.
 
 ## Requirements
 
-- Node.js **>= 20.12.0** (uses native `fetch`, `AbortSignal.timeout`/`AbortSignal.any`, and `node:stream/promises`)
+- Maintained Node.js **22, 24 or 26** (minimum 22.18.0 / 24.11.0 on those lines).
+- A current [FFmpeg release and matching FFprobe](https://ffmpeg.org/download.html) on PATH, or explicit executable paths. Current verification targets FFmpeg 9.0.2. FFprobe is needed for percentage timestamps.
 
 ## Install
 
 ```bash
 npm install video-to-thumbnail
 ```
+
+Upgrading from 1.x? See [MIGRATION.md](./MIGRATION.md) for binary setup and other major-release changes.
 
 ## Quick start
 
@@ -40,9 +43,7 @@ console.log(thumbnailPath); // /abs/path/to/thumbnails/clip-a1b2c3d4.png
 Remote URLs work the same way — the video is downloaded to a temp directory, a frame is extracted, and the temp file is removed automatically, even if generation fails:
 
 ```js
-const thumbnailPath = await generator.getVideoThumbnail(
-  'https://example.com/videos/clip.mp4',
-);
+const thumbnailPath = await generator.getVideoThumbnail('https://example.com/videos/clip.mp4');
 ```
 
 ## Concurrency
@@ -95,12 +96,12 @@ const thumbnailPath = await generator.getVideoThumbnail(videoPathOrUrl, {
 });
 ```
 
-| Option      | Type          | Description                                                                                                            |
-| ----------- | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `timestamp` | `string`      | ffmpeg timemark to capture — seconds (`"2.5"`) or a percentage (`"50%"`). Overrides the constructor's `timestamp`.       |
-| `size`      | `string`      | ffmpeg size spec for the output frame, e.g. `"320x240"`, `"320x?"` (preserve aspect ratio), or `"50%"`. Default: source resolution. |
+| Option      | Type          | Description                                                                                                                                                                                                                                    |
+| ----------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timestamp` | `string`      | ffmpeg timemark to capture — seconds (`"2.5"`) or a percentage (`"50%"`). Overrides the constructor's `timestamp`.                                                                                                                             |
+| `size`      | `string`      | ffmpeg size spec for the output frame, e.g. `"320x240"`, `"320x?"` (preserve aspect ratio), or `"50%"`. Default: source resolution.                                                                                                            |
 | `filename`  | `string`      | Exact output filename (e.g. `"clip.png"`), written directly under `thumbsDir` with **no** random suffix. Must be a bare filename ending in `.png` — no directory separators, no path traversal. Omit for a collision-free auto-generated name. |
-| `signal`    | `AbortSignal` | Cancels this call — see [Cancellation](#cancellation) below.                                                            |
+| `signal`    | `AbortSignal` | Cancels this call — see [Cancellation](#cancellation) below.                                                                                                                                                                                   |
 
 `timestamp` and `size` can also be set as defaults for every call on an instance:
 
@@ -138,16 +139,16 @@ Cancellation isn't treated as a failure: the promise rejects with the signal's o
 
 ### `new ThumbnailGenerator(options?)`
 
-| Option              | Type     | Default          | Description                                                                                   |
-| ------------------- | -------- | ---------------- | ----------------------------------------------------------------------------------------------- |
-| `thumbsDir`          | `string` | `"thumbnails"`   | Directory thumbnails are written to (created if missing). Resolved relative to `process.cwd()`. |
-| `tempDir`            | `string` | `"temp"`         | Directory used to stage downloaded videos before processing. Created and cleaned up automatically. |
-| `concurrency`        | `number` | `5`              | Max thumbnails generated at once by this instance. Must be a positive integer.                  |
-| `timestamp`          | `string` | `"1"`            | Default ffmpeg timemark to capture the frame from — seconds (`"2.5"`) or a percentage (`"50%"`). Overridable per call. |
-| `size`               | `string` | source resolution | Default ffmpeg size spec for the output frame, e.g. `"320x240"`. Overridable per call.        |
-| `downloadTimeoutMs`  | `number` | `30000`          | Abort remote downloads that take longer than this. Must be a positive number.                   |
-| `ffmpegPath`         | `string` | bundled binary   | Path to an ffmpeg executable, if you'd rather not use the bundled one. **Process-global** — see note below. |
-| `ffprobePath`        | `string` | bundled binary   | Path to an ffprobe executable, used only to resolve percentage-style `timestamp` values (e.g. `"50%"`) to an absolute time. **Process-global**, same as `ffmpegPath`. |
+| Option              | Type     | Default           | Description                                                                                                                                   |
+| ------------------- | -------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `thumbsDir`         | `string` | `"thumbnails"`    | Directory thumbnails are written to (created if missing). Resolved relative to `process.cwd()`.                                               |
+| `tempDir`           | `string` | `"temp"`          | Directory used to stage downloaded videos before processing. Created and cleaned up automatically.                                            |
+| `concurrency`       | `number` | `5`               | Max thumbnails generated at once by this instance. Must be a positive integer.                                                                |
+| `timestamp`         | `string` | `"1"`             | Default ffmpeg timemark to capture the frame from — seconds (`"2.5"`) or a percentage (`"50%"`). Overridable per call.                        |
+| `size`              | `string` | source resolution | Default ffmpeg size spec for the output frame, e.g. `"320x240"`. Overridable per call.                                                        |
+| `downloadTimeoutMs` | `number` | `30000`           | Abort remote downloads that take longer than this. Must be a positive integer no greater than 4294967295.                                     |
+| `ffmpegPath`        | `string` | `ffmpeg` on PATH  | Path to an ffmpeg executable, to override PATH lookup. **Per instance**.                                                                      |
+| `ffprobePath`       | `string` | `ffprobe` on PATH | Path to an ffprobe executable, used only to resolve percentage-style `timestamp` values (e.g. `"50%"`) to an absolute time. **Per instance**. |
 
 Throws `RangeError` for an invalid `concurrency` or `downloadTimeoutMs`.
 
@@ -169,12 +170,12 @@ Generates thumbnails for many videos at once, respecting the instance's concurre
 
 All errors extend `ThumbnailError` (itself an `Error`) and carry a stable `code`:
 
-| Class                        | `code`                        | Thrown when...                                                              |
-| ----------------------------- | ------------------------------ | ------------------------------------------------------------------------------ |
-| `ThumbnailDownloadError`      | `THUMBNAIL_DOWNLOAD_FAILED`    | A remote URL can't be fetched, saved, or times out.                          |
-| `ThumbnailGenerationError`    | `THUMBNAIL_GENERATION_FAILED`  | The local video is missing/not a file, or ffmpeg fails to extract a frame.   |
+| Class                      | `code`                        | Thrown when...                                                             |
+| -------------------------- | ----------------------------- | -------------------------------------------------------------------------- |
+| `ThumbnailDownloadError`   | `THUMBNAIL_DOWNLOAD_FAILED`   | A remote URL can't be fetched, saved, or times out.                        |
+| `ThumbnailGenerationError` | `THUMBNAIL_GENERATION_FAILED` | The local video is missing/not a file, or ffmpeg fails to extract a frame. |
 
-The original underlying error is always preserved on `error.cause`.
+Underlying transport/process errors are preserved on `error.cause` when available.
 
 ```js
 import { ThumbnailError } from 'video-to-thumbnail';
@@ -212,20 +213,23 @@ new ThumbnailGenerator({
 });
 ```
 
-**Why keep `fluent-ffmpeg` if it's deprecated on npm?**
-It's a thin, stable wrapper around the ffmpeg CLI with no real behavioral risk from being unmaintained — it hasn't needed to change because the interface it wraps (the ffmpeg command line) hasn't changed. It's still used by a huge number of production packages. This is revisited if that ever stops being true.
+**Why call FFmpeg directly?**
+The wrapper is deprecated. This package needs a small, stable set of CLI operations, so it now invokes those directly with argument arrays and no shell.
 
-**Can I use a newer/system ffmpeg instead of the bundled one?**
-Yes — pass `ffmpegPath` (and `ffprobePath`, if you also want a matching ffprobe) to the constructor:
+**How do I choose executable paths?**
+Put current executables on PATH, or pass `ffmpegPath` and its matching `ffprobePath` to the constructor:
 
 ```js
-new ThumbnailGenerator({ ffmpegPath: '/usr/local/bin/ffmpeg', ffprobePath: '/usr/local/bin/ffprobe' });
+new ThumbnailGenerator({
+  ffmpegPath: '/usr/local/bin/ffmpeg',
+  ffprobePath: '/usr/local/bin/ffprobe',
+});
 ```
 
-`fluent-ffmpeg` caches these paths at the module level rather than per-instance, so they're inherently process-wide state, not per-instance state. This package minimizes the blast radius: a path is only changed when an instance explicitly passes it, or when it's the very first `ThumbnailGenerator` constructed in the process — plain `new ThumbnailGenerator()` calls with no `ffmpegPath`/`ffprobePath` never clobber a path set explicitly by an earlier instance. What's still unavoidable (a `fluent-ffmpeg` limitation, not this package's) is two *different* explicit values for the same path in one process: whichever is constructed last wins for every instance, including ones already created. If you need two different binaries alive at once, run them in separate processes/workers.
+Executable paths are independent per instance. A missing executable raises a typed generation error with the original spawn error as its cause.
 
 **Why does resolving `timestamp: "50%"` need ffprobe?**
-A percentage timemark can only be converted to an absolute seek time once ffmpeg knows the video's duration, which requires probing the file first. This package bundles `@ffprobe-installer/ffprobe` for exactly that reason, so it works out of the box — you only need to think about this if you've overridden `ffmpegPath`/`ffprobePath` with a custom install that's missing ffprobe.
+A percentage timemark requires the video duration. Install FFprobe alongside FFmpeg, or pass `ffprobePath`. Absolute second/clock timestamps do not invoke FFprobe.
 
 **How do I get a deterministic output path instead of a random suffix?**
 Pass `filename` per call: `generator.getVideoThumbnail(video, { filename: `${videoId}.png` })`. See [Per-call options](#per-call-options).
@@ -241,10 +245,12 @@ cd video-to-thumbnail
 pnpm install
 pnpm test        # node:test, includes real ffmpeg + mocked network calls
 pnpm typecheck    # tsc over the JSDoc-typed source, no build output
+pnpm lint         # correctness checks over source, tests, scripts and examples
+pnpm format:check # verify formatting; use pnpm format to apply it
 pnpm build        # emits .d.ts files to dist/
 ```
 
-CI runs the same checks on Linux, macOS, and Windows across Node 22 and 24.
+CI configures the same checks on Linux, macOS, and Windows across Node 22, 24 and 26. Run `pnpm run verify` to include archive installation checks.
 
 ## License
 
